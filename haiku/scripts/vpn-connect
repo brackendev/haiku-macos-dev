@@ -1,0 +1,189 @@
+#!/bin/sh
+# VPN connection script for Haiku
+# Install: cp to ~/bin/vpn-connect && chmod +x ~/bin/vpn-connect
+
+set -e
+
+# Configuration (override via environment or edit defaults)
+VPN_CONFIG="${VPN_CONFIG:-$HOME/.vpn/config.ovpn}"
+VPN_AUTH="${VPN_AUTH:-$HOME/.vpn/auth}"
+VPN_ROUTE_ALL="${VPN_ROUTE_ALL:-false}"
+VPN_ROUTES="${VPN_ROUTES:-}"
+VPN_DAEMON="${VPN_DAEMON:-false}"
+DO_CONNECT="false"
+
+usage() {
+    echo "Usage: vpn-connect [options]"
+    echo ""
+    echo "Options:"
+    echo "  -x, --connect        Connect to VPN (required to actually connect)"
+    echo "  -c, --config FILE    OpenVPN config file (default: ~/.vpn/config.ovpn)"
+    echo "  -a, --auth FILE      Auth credentials file (default: ~/.vpn/auth)"
+    echo "  -r, --route-all      Route all traffic through VPN (implies --connect)"
+    echo "  -R, --routes CIDRS   Specific routes, implies --connect (e.g., 10.0.0.0/8,192.168.0.0/16)"
+    echo "  -d, --daemon         Run in background (daemonize)"
+    echo "  -h, --help           Show this help"
+    echo ""
+    echo "Setup:"
+    echo "  1. Create ~/.vpn/ directory"
+    echo "  2. Place your .ovpn config in ~/.vpn/config.ovpn"
+    echo "  3. Create ~/.vpn/auth with username on line 1, password on line 2"
+    echo "  4. chmod 600 ~/.vpn/auth"
+    echo ""
+    echo "Examples:"
+    echo "  vpn-connect -x                   # Connect with no routing"
+    echo "  vpn-connect -r                   # Route all traffic through VPN"
+    echo "  vpn-connect -R 10.0.0.0/8        # Route only 10.x.x.x through VPN"
+    exit 0
+}
+
+# Show help if no arguments
+[ $# -eq 0 ] && usage
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -x|--connect) DO_CONNECT="true"; shift;;
+        -c|--config) VPN_CONFIG="$2"; shift 2;;
+        -a|--auth) VPN_AUTH="$2"; shift 2;;
+        -r|--route-all) VPN_ROUTE_ALL="true"; DO_CONNECT="true"; shift;;
+        -R|--routes) VPN_ROUTES="$2"; DO_CONNECT="true"; shift 2;;
+        -d|--daemon) VPN_DAEMON="true"; shift;;
+        -h|--help) usage;;
+        *) echo "Unknown option: $1"; usage;;
+    esac
+done
+
+# Must explicitly connect
+[ "$DO_CONNECT" = "false" ] && usage
+
+# Check dependencies
+check_deps() {
+    if ! command -v openvpn >/dev/null 2>&1; then
+        echo "OpenVPN not found. Installing..."
+        pkgman install -y openvpn
+    fi
+}
+
+# Validate config
+validate() {
+    if [ ! -f "$VPN_CONFIG" ]; then
+        echo "Error: Config file not found: $VPN_CONFIG"
+        echo "Create ~/.vpn/ and place your .ovpn file there."
+        exit 1
+    fi
+    if [ ! -f "$VPN_AUTH" ]; then
+        echo "Error: Auth file not found: $VPN_AUTH"
+        echo "Create $VPN_AUTH with username on line 1, password on line 2."
+        exit 1
+    fi
+}
+
+# Get current default gateway before connecting
+get_default_gw() {
+    # Haiku route format: Destination Netmask Gateway Flags Interface
+    # Default route has 0.0.0.0 as destination
+    route list 2>/dev/null | awk '/^[[:space:]]*0\.0\.0\.0[[:space:]]+0\.0\.0\.0/ {print $3}' | head -1
+}
+
+# Add routes after connection
+# Called with: $1=tun_dev $2=tun_ip $3=tun_gw
+setup_routes() {
+    local tun_dev="$1"
+    local tun_ip="$2"
+    local tun_gw="$3"
+    local orig_gw="$4"
+    local vpn_server="$5"
+
+    echo "Setting up routes..."
+    echo "  Tunnel: $tun_dev ($tun_ip)"
+    echo "  VPN gateway: $tun_gw"
+    echo "  Original gateway: $orig_gw"
+
+    if [ "$VPN_ROUTE_ALL" = "true" ]; then
+        # Route to VPN server via original gateway (prevent loop)
+        route add /dev/tun/0 "$vpn_server" gw "$orig_gw" 2>/dev/null || true
+        # Default route through VPN
+        route delete /dev/tun/0 default 2>/dev/null || true
+        route add /dev/tun/0 default gw "$tun_gw"
+        echo "  Added default route through VPN"
+    elif [ -n "$VPN_ROUTES" ]; then
+        # Add specific routes
+        echo "$VPN_ROUTES" | tr ',' '\n' | while read cidr; do
+            if [ -n "$cidr" ]; then
+                route add /dev/tun/0 "$cidr" gw "$tun_gw" 2>/dev/null || true
+                echo "  Added route: $cidr"
+            fi
+        done
+    else
+        echo "  No routes configured. Use -r for all traffic or -R for specific routes."
+    fi
+}
+
+# Extract VPN server from config
+get_vpn_server() {
+    grep -E "^remote " "$VPN_CONFIG" | head -1 | awk '{print $2}'
+}
+
+# Main
+main() {
+    check_deps
+    validate
+
+    local orig_gw=$(get_default_gw)
+    local vpn_server=$(get_vpn_server)
+
+    echo "Starting VPN connection..."
+    echo "  Config: $VPN_CONFIG"
+    echo "  Server: $vpn_server"
+    echo "  Original gateway: $orig_gw"
+
+    # Create tun interface
+    ifconfig tun/0 up 2>/dev/null || true
+
+    # Start OpenVPN
+    # --route-noexec prevents OpenVPN from trying to add routes (fails on Haiku)
+    local daemon_opt=""
+    [ "$VPN_DAEMON" = "true" ] && daemon_opt="--daemon"
+    openvpn --config "$VPN_CONFIG" \
+        --auth-user-pass "$VPN_AUTH" \
+        --route-noexec \
+        --verb 3 \
+        $daemon_opt &
+
+    # Wait for connection (check for tunnel IP)
+    echo "Waiting for connection..."
+    local tun_ip=""
+    local attempts=0
+    while [ -z "$tun_ip" ] && [ $attempts -lt 30 ]; do
+        sleep 1
+        tun_ip=$(ifconfig tun/0 2>/dev/null | sed -n 's/.*inet addr: *\([0-9.]*\).*/\1/p')
+        attempts=$((attempts + 1))
+    done
+
+    if [ -z "$tun_ip" ]; then
+        echo "Error: VPN failed to connect (no tunnel IP after 30s)"
+        exit 1
+    fi
+
+    local tun_gw="${tun_ip%.*}.1"  # Assume .1 gateway
+    setup_routes "tun/0" "$tun_ip" "$tun_gw" "$orig_gw" "$vpn_server"
+
+    # Find actual OpenVPN PID (Haiku ps format: Team Id #Threads Gid Uid)
+    local pid=$(ps | grep "[o]penvpn" | awk '{print $(NF-3)}' | head -1)
+
+    echo ""
+    echo "VPN connected. Tunnel IP: $tun_ip"
+    [ -n "$pid" ] && echo "OpenVPN PID: $pid"
+    echo ""
+    [ -n "$pid" ] && echo "To disconnect: kill $pid"
+
+    # In daemon mode, exit immediately; otherwise wait for OpenVPN
+    if [ "$VPN_DAEMON" = "true" ]; then
+        echo "Running in daemon mode."
+    elif [ -n "$pid" ]; then
+        wait $pid 2>/dev/null || true
+    fi
+}
+
+main

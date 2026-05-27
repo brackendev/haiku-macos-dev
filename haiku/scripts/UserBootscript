@@ -1,0 +1,22 @@
+#!/bin/sh
+# Auto-mount NFS share from Mac host
+# Install: cp to ~/config/settings/boot/UserBootscript && chmod +x
+# Edit NFS_SRC below to replace YOUR_USERNAME with your macOS username.
+
+MOUNT_POINT="$HOME/mac"
+NFS_SRC="10.0.2.2:/System/Volumes/Data/Users/YOUR_USERNAME/Dev/Haiku"
+NFS_UID=501
+NFS_GID=20
+
+mkdir -p "$MOUNT_POINT"
+
+# Already mounted? Exit early
+df "$MOUNT_POINT" 2>/dev/null | grep -q nfs && exit 0
+
+# Retry mount_nfs up to 30 times (RPC services may not be ready on cold boot)
+i=0
+while [ $i -lt 30 ]; do
+  mount_nfs "$NFS_SRC" "$MOUNT_POINT" "$NFS_UID" "$NFS_GID" 2>/dev/null && exit 0
+  sleep 1
+  i=$((i + 1))
+done
